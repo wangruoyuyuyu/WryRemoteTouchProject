@@ -4,6 +4,48 @@ import threading
 import queue
 import sys
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _PM_REMOVE = 0x0001
+    _WM_HOTKEY = 0x0312
+    _MOD_ALT = 0x0001
+    _MOD_CONTROL = 0x0002
+    _HOTKEYS = [(0x0002 | 0x0001, 0x4D, "Ctrl+Alt+M"),
+                (0x0002 | 0x0001, 0x4E, "Ctrl+Alt+N"),  # fallback (WeType grabs Ctrl+Alt+M)
+                (0x0002 | 0x0001, 0x42, "Ctrl+Alt+B")]  # fallback 2
+
+
+class HotkeyThread(threading.Thread):
+    """Global hotkey via RegisterHotKey + message loop, with fallbacks."""
+
+    _HOTKEYS = _HOTKEYS
+
+    def __init__(self, callback):
+        super().__init__(daemon=True)
+        self._callback = callback
+        self._started = threading.Event()
+        self._ok = False
+        self.key_name = None
+
+    def run(self):
+        for i, (mods, vk, name) in enumerate(self._HOTKEYS, start=1):
+            if _user32.RegisterHotKey(None, i, mods, vk):
+                self._hotkey_id = i
+                self.key_name = name
+                self._ok = True
+                break
+        self._started.set()
+        if not self._ok:
+            return
+        msg = wintypes.MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == _WM_HOTKEY and msg.wParam == self._hotkey_id:
+                self._callback()
+
+
 
 class MsgTypes:
     PRESS = 0
@@ -86,14 +128,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Keyboard ──
 
+    def toggle_opacity(self):
+        self._opacity_hi = not getattr(self, '_opacity_hi', False)
+        # Run on the GUI thread via queued invocation (hotkey fires on worker thread)
+        QtCore.QMetaObject.invokeMethod(
+            self, "apply_opacity", QtCore.Qt.ConnectionType.QueuedConnection)
+
+    @QtCore.Slot()
+    def apply_opacity(self):
+        self.setWindowOpacity(0.5 if getattr(self, '_opacity_hi', False) else 0.01)
+
     def keyPressEvent(self, event):
-        # Ctrl+Alt+M: toggle opacity for moving the window
         mods = event.modifiers()
         if (event.nativeVirtualKey() == 0x4D  # 'M'
                 and mods & QtCore.Qt.ControlModifier
                 and mods & QtCore.Qt.AltModifier):
-            self._opacity_hi = not getattr(self, '_opacity_hi', False)
-            self.setWindowOpacity(0.5 if self._opacity_hi else 0.01)
+            self.toggle_opacity()
             return
         vk = event.nativeVirtualKey()
         self._put(MsgTypes.KEY_PRESS, (vk, (0, 0), (0, 0)))
@@ -141,5 +191,13 @@ class MainWindow(QtWidgets.QMainWindow):
 if __name__ == "__main__":
     qa = QtWidgets.QApplication(list())
     mw = MainWindow()
+    if sys.platform == "win32":
+        hk = HotkeyThread(mw.toggle_opacity)
+        hk.start()
+        hk._started.wait()  # block until registration attempted (thread start can be slow)
+        if not hk._ok:
+            print("Warning: no hotkey could be registered", file=sys.stderr)
+        else:
+            print(f"Toggle hotkey: {hk.key_name}")
     mw.show()
     qa.exec()
